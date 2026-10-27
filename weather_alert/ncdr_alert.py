@@ -320,6 +320,198 @@ def send_discord(embeds: list[dict]) -> None:
         urllib.request.urlopen(req, timeout=30)
 
 
+# ---------------------------------------------------------------- 颱風生成預告（警報發布前）
+# 資料：中央氣象署開放資料 W-C0034-005 熱帶氣旋路徑（含熱帶性低氣壓 TD），需要 CWA_API_KEY
+CWA_TC_URL = "https://opendata.cwa.gov.tw/api/v1/rest/datastore/W-C0034-005"
+CWA_TC_PAGE = "https://www.cwa.gov.tw/V8/C/P/Typhoon/TY_NEWS.html"
+
+
+def haversine_km(lat1, lon1, lat2, lon2) -> float:
+    from math import asin, cos, radians, sin, sqrt
+    dlat, dlon = radians(lat2 - lat1), radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    return 6371 * 2 * asin(sqrt(a))
+
+
+def parse_coord(s) -> tuple[float, float] | None:
+    """'125.2,21.0' 或 '21.0,125.2' → (lat, lon)，自動判斷順序"""
+    try:
+        a, b = [float(x) for x in str(s).replace(" ", "").split(",")[:2]]
+    except (ValueError, TypeError):
+        return None
+    return (b, a) if a > 90 else (a, b)
+
+
+def _val(x):
+    """CWA 有些欄位是 {'value': ..} 或 [{'value': .., 'lang': ..}]"""
+    if isinstance(x, list):
+        zh = [i for i in x if isinstance(i, dict) and i.get("lang", "zh") .startswith("zh")]
+        x = (zh or x or [None])[0]
+    if isinstance(x, dict):
+        x = x.get("value", x.get("radius", ""))
+    return x if x is not None else ""
+
+
+def fetch_cwa_tc() -> dict | None:
+    path = env("CWA_TC_FILE")
+    if path:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    key = env("CWA_API_KEY")
+    if not key:
+        return None
+    import ssl
+    import urllib.parse
+    url = f"{CWA_TC_URL}?{urllib.parse.urlencode({'Authorization': key, 'format': 'JSON'})}"
+    req = urllib.request.Request(url, headers={"User-Agent": "site-weather-alert/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.URLError as ex:
+        # 氣象署主機憑證鏈常缺中繼憑證，Python 驗證會失敗；這是公開唯讀資料，退回不驗證再試一次
+        if "CERTIFICATE_VERIFY_FAILED" not in str(ex):
+            raise
+        ctx = ssl._create_unverified_context()
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+
+DIR_ZH = {"N": "北", "NNE": "北北東", "NE": "東北", "ENE": "東北東", "E": "東", "ESE": "東南東",
+          "SE": "東南", "SSE": "南南東", "S": "南", "SSW": "南南西", "SW": "西南", "WSW": "西南西",
+          "W": "西", "WNW": "西北西", "NW": "西北", "NNW": "北北西"}
+
+
+def fmt_move(d, v) -> str:
+    d = DIR_ZH.get(str(d).upper(), str(d))
+    out = f"向{d}" if d else ""
+    if v not in ("", None):
+        out += f"，每小時 {v} 公里"
+    return out.strip("，")
+
+
+def parse_cwa_tc(data: dict, site: tuple[float, float]) -> list[dict]:
+    recs = (data or {}).get("records", {})
+    tcs = recs.get("tropicalCyclones", recs).get("tropicalCyclone", [])
+    if isinstance(tcs, dict):
+        tcs = [tcs]
+    out = []
+    for tc in tcs:
+        fixes = (tc.get("analysisData") or {}).get("fix") or []
+        if isinstance(fixes, dict):
+            fixes = [fixes]
+        if not fixes:
+            continue
+        cur = sorted(fixes, key=lambda f: str(f.get("fixTime", "")))[-1]
+        pos = parse_coord(cur.get("coordinate"))
+        if not pos:
+            continue
+        fc = (tc.get("forecastData") or {}).get("fix") or []
+        if isinstance(fc, dict):
+            fc = [fc]
+        best = (haversine_km(*site, *pos), "現在")
+        for f in fc:
+            p = parse_coord(f.get("coordinate"))
+            if p:
+                d = haversine_km(*site, *p)
+                if d < best[0]:
+                    tau = f.get("tau", "")
+                    best = (d, f"約 {tau} 小時後" if tau != "" else (f.get("fixTime") or "預報期間"))
+        name_en = str(tc.get("typhoonName") or "").strip()
+        name_zh = str(tc.get("cwaTyphoonName") or "").strip()
+        td_no = str(tc.get("cwaTdNo") or "").strip()
+        ty_no = str(tc.get("cwaTyNo") or "").strip()
+        named = bool(name_en or name_zh or ty_no)
+        year = str(tc.get("year") or datetime.now(TW).year)
+        out.append({
+            "key": f"{year}-TD{td_no}" if td_no else f"{year}-{name_en or ty_no}",
+            "named": named,
+            "label": (f"{'第' + ty_no + '號' if ty_no else ''}颱風 {name_zh}（{name_en}）".replace("（）", "")
+                      if named else f"熱帶性低氣壓 TD{td_no}"),
+            "lat": pos[0], "lon": pos[1],
+            "dist": haversine_km(*site, *pos),
+            "min_dist": best[0], "min_when": best[1],
+            "wind": _val(cur.get("maxWindSpeed")),
+            "gust": _val(cur.get("maxGustSpeed")),
+            "pressure": _val(cur.get("pressure")),
+            "move": fmt_move(_val(cur.get("movingDirection")), _val(cur.get("movingSpeed"))),
+            "predict": _val(cur.get("movingPrediction")),
+            "r15": _val(cur.get("circleOf15Ms")),
+            "time": str(cur.get("fixTime", "")),
+            "has_fc": bool(fc),
+        })
+    return out
+
+
+def build_tc_embed(tc: dict, kind: str, site_name: str) -> dict:
+    title = {"form": "🌀 颱風生成預告", "td": "🌀 熱帶性低氣壓形成", "approach": "⚠️ 預報接近工地"}[kind]
+    lines = [
+        f"**位置**：北緯 {tc['lat']:.1f}°、東經 {tc['lon']:.1f}°，距{site_name}約 **{tc['dist']:,.0f} 公里**",
+    ]
+    if tc["has_fc"]:
+        lines.append(f"**預報最接近**：{tc['min_when']}，約 **{tc['min_dist']:,.0f} 公里**")
+    if tc["wind"]:
+        lines.append(f"**近中心最大風速**：每秒 {tc['wind']} 公尺" + (f"，陣風 {tc['gust']} 公尺" if tc["gust"] else ""))
+    if tc["pressure"]:
+        lines.append(f"**中心氣壓**：{tc['pressure']} 百帕")
+    if tc["r15"]:
+        lines.append(f"**七級風暴風半徑**：{tc['r15']} 公里")
+    if tc["move"]:
+        lines.append(f"**移動**：{tc['move']}")
+    if tc["predict"]:
+        lines.append(str(tc["predict"])[:300])
+    lines.append("\n目前尚未發布颱風警報，先提醒注意後續動態；可先檢查抽水機、帆布、綁紮材料是否備妥。")
+    color = COLOR["orange"] if kind == "approach" else COLOR["blue"]
+    return {
+        "title": f"{title}｜{tc['label']}",
+        "description": "\n".join(lines),
+        "color": color,
+        "fields": [{"name": "連結", "value": f"[氣象署颱風消息]({CWA_TC_PAGE})　[NCDR 颱風監測]({WATCH_URL})",
+                    "inline": False}],
+        "footer": {"text": f"資料來源：中央氣象署熱帶氣旋路徑　分析時間 {tc['time']}"},
+    }
+
+
+def check_tc_formation(state: dict, now: datetime, quiet: bool) -> list[dict]:
+    """新颱風／TD 出現、TD 升格颱風、預報接近工地 → 各提醒一次"""
+    data = fetch_cwa_tc()
+    if data is None:
+        return []
+    site = (float(env("SITE_LAT", "25.055")), float(env("SITE_LON", "121.607")))  # 預設南港
+    site_name = env("SITE_NAME", "工地")
+    watch_km = float(env("TC_WATCH_KM", "2500"))      # 生成時距離在這範圍內，或預報會進到這範圍才提醒
+    near_km = float(env("TC_APPROACH_KM", "800"))      # 預報或現在進到這範圍 → 接近提醒
+    seen = state.setdefault("tc", {})
+    embeds = []
+    for tc in parse_cwa_tc(data, site):
+        rec = seen.get(tc["key"], {})
+        nearest = min(tc["dist"], tc["min_dist"])
+        kinds = []
+        if nearest <= watch_km:
+            if not rec.get("notified"):
+                kinds.append("form" if tc["named"] else "td")
+            elif tc["named"] and not rec.get("named"):
+                kinds.append("form")                   # TD 升格成颱風
+        if nearest <= near_km and not rec.get("approach"):
+            kinds.append("approach")
+        rec["last_seen"] = now.isoformat()
+        if kinds and not quiet:
+            kind = "approach" if "approach" in kinds else kinds[0]
+            embeds.append(build_tc_embed(tc, kind, site_name))
+            rec["notified"] = True
+            rec["named"] = tc["named"]
+            if "approach" in kinds:
+                rec["approach"] = True
+        seen[tc["key"]] = rec
+    # 清掉 10 天沒出現的舊紀錄
+    for k in list(seen):
+        try:
+            if now - datetime.fromisoformat(seen[k]["last_seen"]) > timedelta(days=10):
+                del seen[k]
+        except (KeyError, ValueError):
+            del seen[k]
+    return embeds
+
+
 # ---------------------------------------------------------------- 主流程
 def load_state(path: str) -> dict:
     try:
@@ -396,6 +588,12 @@ def run(now: datetime | None = None) -> list[dict]:
             change = f"持續中（每 {remind_h:g} 小時提醒）"
         embeds.append(build_embed(cat, e, info, change))
         state[cat] = {"active": True, "sig": sig, "last_push": now.isoformat(), "last_id": e["id"]}
+
+    # 颱風生成預告（有設 CWA_API_KEY 才會跑；失敗不影響上面的警報推播）
+    try:
+        embeds.extend(check_tc_formation(state, now, quiet))
+    except Exception as ex:
+        print(f"颱風生成檢查失敗：{ex}", file=sys.stderr)
 
     if embeds:
         send_discord(embeds)
