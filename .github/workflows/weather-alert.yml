@@ -1,0 +1,52 @@
+name: 工地天氣警示
+
+on:
+  # 主要：用 cron-job.org 每 10 分鐘打 workflow_dispatch（跟代辦提醒同一套做法）
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "強制推送目前狀態（測試用，填 1）"
+        required: false
+        default: ""
+  # 備援：GitHub 自己的排程（尖峰時常延遲，所以不當主力）
+  schedule:
+    - cron: "*/15 * * * *"
+
+concurrency:
+  group: weather-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # 推播狀態存在 Actions cache，不 commit 回 repo（避免每 10 分鐘觸發 Streamlit 重新部署）
+      - name: 還原推播狀態
+        uses: actions/cache/restore@v4
+        with:
+          path: weather_alert/state.json
+          key: weather-state-${{ github.run_id }}
+          restore-keys: weather-state-
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 檢查示警並推播
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_WEATHER }}
+          DISCORD_MENTION: ${{ vars.WEATHER_MENTION }}
+          SITE_COUNTIES: ${{ vars.SITE_COUNTIES || '臺北市,新北市' }}
+          RAIN_KEYWORDS: ${{ vars.RAIN_KEYWORDS }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: python weather_alert/ncdr_alert.py
+
+      - name: 儲存推播狀態
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: weather_alert/state.json
+          key: weather-state-${{ github.run_id }}
