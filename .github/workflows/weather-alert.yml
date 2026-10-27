@@ -1,16 +1,16 @@
 name: 工地天氣警示
 
 on:
-  # 主要：用 cron-job.org 每 10 分鐘打 workflow_dispatch（跟代辦提醒同一套做法）
+  # 私人 repo 版：每 30 分鐘一次，每月約 1,440 分鐘，加上代辦提醒仍在 2,000 分鐘免費額度內
+  # 不需要再設 cron-job.org
   workflow_dispatch:
     inputs:
       force:
         description: "強制推送目前狀態（測試用，填 1）"
         required: false
         default: ""
-  # 備援：GitHub 自己的排程（尖峰時常延遲，所以不當主力）
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "7,37 * * * *"
 
 concurrency:
   group: weather-alert
